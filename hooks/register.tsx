@@ -2375,15 +2375,24 @@ async function diffFile($: EngineInterface, path: string): Promise<void> {
   // ローカル改修：git 管理外では外部の差分コマンド（hunk diff など）を起動しない。
   // git の変更を見るコマンドしか想定しておらず、起動してもエラーで終わるだけのため、トーストで知らせて戻る。
   const isDir = (await get($)).nodes.find(n => n.id === path)?.kind === 'dir'
-  const inRepo = await git($, isDir ? path : dirname(path), ['rev-parse', '--is-inside-work-tree']).then(r => r.exitCode === 0, () => false)
-  if (!inRepo) {
+  const top = await git($, isDir ? path : dirname(path), ['rev-parse', '--show-toplevel']).then(r => (r.exitCode === 0 ? r.stdout.trim() : ''), () => '')
+  if (!top) {
     $.ui.toast(`${shortPath(path)} is not in a git repository`)
     return
   }
   const os = await osName($)
   const host = await editorHost($, os)
   try {
-    if (host === 'herdr') return await openInHerdr($, diffWithSetting, path)
+    if (host === 'herdr') {
+      // ローカル改修：Diff with が hunk なら、filetree が開いた同じリポジトリの hunk へファイルを加え、ペインを増やさない。
+      // 開いていなければ新しいペインで起動し、そのセッションを覚えて次の d で使う。
+      const hunk = isHunkCommand(diffWithSetting)
+      if (hunk && (await addToHunk($, top, repoRelative(top, path), isDir))) return
+      const before = hunk ? new Set((await hunkSessionList($)).map(s => s.sessionId)) : new Set<string>()
+      await openInHerdr($, diffWithSetting, path)
+      if (hunk) void rememberHunk($, top, before)
+      return
+    }
     if (host === 'tmux') {
       const run = await $.process.run(tmuxCommand(targetSetting, dirname(path), [...words(diffWithSetting), path]), { timeoutMs: 10_000 })
       if (run.exitCode !== 0) $.ui.toast(`could not diff ${shortPath(path)} with ${diffWithSetting}: ${run.stderr.trim().split('\n')[0] || `exit ${run.exitCode}`}`)
@@ -2398,6 +2407,69 @@ async function diffFile($: EngineInterface, path: string): Promise<void> {
     $.ui.toast('Diff with: a terminal command needs tmux, herdr or Linux. Clear Diff with to see the diff in the pane.')
   } catch {
     $.ui.toast(`could not diff ${shortPath(path)} with ${diffWithSetting}`)
+  }
+}
+
+// ローカル改修：filetree が herdr のペインに開いた hunk のセッション（リポジトリのルート → セッション ID）。
+// d のたびにペインを増やさず、同じリポジトリならこのセッションへファイルを加えるために覚える。
+// 利用者が自分で開いた hunk（hunk-watch などのリポジトリ全体の表示）は対象にしない。加えると表示が絞り込まれて壊れるため。
+const hunkSessions = new Map<string, string>()
+
+type HunkSession = { sessionId: string; repoRoot: string; files: { path: string }[] }
+
+// Diff with が hunk の起動かの判定
+// 先頭の語のファイル名が hunk（Windows の hunk.exe を含む）なら true を返す。
+function isHunkCommand(command: string): boolean {
+  return /^hunk(\.exe)?$/i.test((words(command)[0] ?? '').split(/[\\/]/).pop() ?? '')
+}
+
+// リポジトリのルートからの相対パス
+// hunk のセッションはファイルを相対パスで持つため、それに揃える。ルート自身は "." を返す。
+// Windows のドライブ文字の大小が git と filetree で食い違っても一致するよう、大小を無視して比べる。
+function repoRelative(top: string, path: string): string {
+  if (path.toLowerCase() === top.toLowerCase()) return '.'
+  return path.toLowerCase().startsWith(`${top.toLowerCase()}/`) ? path.slice(top.length + 1) : path
+}
+
+// 動いている hunk のセッション一覧
+// hunk session list の JSON を読む。hunk が見つからないか失敗したら空を返す。
+async function hunkSessionList($: EngineInterface): Promise<HunkSession[]> {
+  try {
+    const run = await $.process.run(['hunk', 'session', 'list', '--json'], { timeoutMs: 10_000 })
+    return run.exitCode === 0 ? ((JSON.parse(run.stdout) as { sessions?: HunkSession[] }).sessions ?? []) : []
+  } catch {
+    return []
+  }
+}
+
+// 開いている hunk へのファイルの追加
+// filetree が開いた同じリポジトリの hunk が動いていれば、表示中のファイルに rel を加えて reload し、ファイルなら rel へ移動する。
+// 加えられたら true、セッションがないか reload に失敗したら false を返す（呼び出し元は新しいペインで起動する）。
+async function addToHunk($: EngineInterface, top: string, rel: string, isDir: boolean): Promise<boolean> {
+  const id = hunkSessions.get(top)
+  const live = id ? (await hunkSessionList($)).find(s => s.sessionId === id) : undefined
+  if (!id || !live) {
+    hunkSessions.delete(top)
+    return false
+  }
+  const paths = [...new Set([...live.files.map(f => f.path), rel])]
+  const run = await $.process.run(['hunk', 'session', 'reload', id, '--', 'diff', '--', ...paths], { timeoutMs: 10_000 })
+  if (run.exitCode !== 0) return false
+  if (!isDir) await $.process.run(['hunk', 'session', 'navigate', id, '--file', rel, '--hunk', '1'], { timeoutMs: 10_000 }).catch(() => undefined)
+  return true
+}
+
+// 新しく開いた hunk のセッションの記録
+// 起動前に無かったセッションのうち、同じリポジトリのものが現れるまで 0.5 秒おきに最大 5 秒待って覚える。
+// 見つからなければ何も覚えず、次の d はまた新しいペインで起動する。
+async function rememberHunk($: EngineInterface, top: string, before: Set<string>): Promise<void> {
+  for (let i = 0; i < 10; i++) {
+    const found = (await hunkSessionList($)).find(s => !before.has(s.sessionId) && s.repoRoot.toLowerCase() === top.toLowerCase())
+    if (found) {
+      hunkSessions.set(top, found.sessionId)
+      return
+    }
+    await new Promise<void>(resolve => $.clock.after(500, () => resolve()))
   }
 }
 
