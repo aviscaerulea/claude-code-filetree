@@ -101,14 +101,18 @@ export function herdrSplit(herdr: string, dir: string, where: Target = 'auto', w
   return [herdr, ...(where === 'tab' ? ['tab', 'create', ...(workspace ? ['--workspace', workspace] : [])] : where === 'workspace' ? ['workspace', 'create'] : ['pane', 'split', '--current', '--direction', where === 'pane below' ? 'down' : 'right']), '--focus', '--cwd', dir]
 }
 
-export function herdrOpenCommand(herdr: string, editor: string, target: string, line?: number, where: Target = 'auto', workspace = '') {
+// windows：ローカル改修。Windows の herdr のペインは cmd.exe で動くため、POSIX の exec と単一引用符が使えない。
+// cmd の書式で語を二重引用符で囲み、対象は %PANE_OPEN_TARGET% で渡し、正常終了したら && exit でペインを閉じる（exec と同じ見え方にする）。
+// 失敗時（git 管理外での hunk diff など）はエラーを読めるようにペインを残す。
+export function herdrOpenCommand(herdr: string, editor: string, target: string, line?: number, where: Target = 'auto', workspace = '', windows = false) {
   const argv = words(editor)
   if (!argv[0]) throw new Error('Editor command is empty')
   const dir = target.slice(0, target.lastIndexOf('/')) || '/'
-  const command = [...argv, ...(line ? [`+${line}`] : [])].map(w => `'${w.replace(/'/g, "'\\''")}'`).join(' ')
+  const parts = [...argv, ...(line ? [`+${line}`] : [])]
+  const command = windows ? parts.map(w => `"${w}"`).join(' ') : parts.map(w => `'${w.replace(/'/g, "'\\''")}'`).join(' ')
   return {
     split: [...herdrSplit(herdr, dir, where, workspace), '--env', `PANE_OPEN_TARGET=${target}`],
-    run: (pane: string) => [herdr, 'pane', 'run', pane, `exec ${command} "$PANE_OPEN_TARGET"`],
+    run: (pane: string) => [herdr, 'pane', 'run', pane, windows ? `${command} "%PANE_OPEN_TARGET%" && exit` : `exec ${command} "$PANE_OPEN_TARGET"`],
     init: { timeoutMs: 10_000 },
   }
 }

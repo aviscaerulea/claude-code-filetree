@@ -2372,6 +2372,14 @@ async function diffFile($: EngineInterface, path: string): Promise<void> {
     $.clock.after(100, () => parkPreview($))
     return
   }
+  // ローカル改修：git 管理外では外部の差分コマンド（hunk diff など）を起動しない。
+  // git の変更を見るコマンドしか想定しておらず、起動してもエラーで終わるだけのため、トーストで知らせて戻る。
+  const isDir = (await get($)).nodes.find(n => n.id === path)?.kind === 'dir'
+  const inRepo = await git($, isDir ? path : dirname(path), ['rev-parse', '--is-inside-work-tree']).then(r => r.exitCode === 0, () => false)
+  if (!inRepo) {
+    $.ui.toast(`${shortPath(path)} is not in a git repository`)
+    return
+  }
   const os = await osName($)
   const host = await editorHost($, os)
   try {
@@ -2854,13 +2862,15 @@ async function openFile($: EngineInterface, path: string, how: { mode?: string; 
 }
 
 async function editorHost($: EngineInterface, os: 'linux' | 'darwin' | 'win32'): Promise<'tmux' | 'herdr' | ''> {
-  if (os === 'win32') return ''
+  // ローカル改修：Windows でも herdr の中なら herdr のペインを使う（tmux は Windows にないので見ない）。
+  // ペインのシェルは cmd.exe なので、送るコマンドの書式は herdrOpenCommand の windows 引数で切り替える。
+  if (os === 'win32') return (await $.env.get('HERDR_ENV')) ? 'herdr' : ''
   if (await $.env.get('TMUX')) return 'tmux'
   return (await $.env.get('HERDR_ENV')) ? 'herdr' : ''
 }
 
 async function openInHerdr($: EngineInterface, editor: string, path: string, line?: number): Promise<void> {
-  const { split, run, init } = herdrOpenCommand((await $.env.get('HERDR_BIN_PATH')) || 'herdr', editor, path, line, targetSetting, (await $.env.get('HERDR_WORKSPACE_ID')) || '')
+  const { split, run, init } = herdrOpenCommand((await $.env.get('HERDR_BIN_PATH')) || 'herdr', editor, path, line, targetSetting, (await $.env.get('HERDR_WORKSPACE_ID')) || '', (await osName($)) === 'win32')
   const made = await $.process.run(split, init)
   const sent = made.exitCode === 0 ? await $.process.run(run(herdrPane(made.stdout)), init) : made
   if (sent.exitCode !== 0) $.ui.toast(`could not open ${path} with ${editor}: ${herdrError(sent.stderr) || `exit ${sent.exitCode}`}`)
@@ -3241,7 +3251,8 @@ export const register: Register = (on, options) => {
     const windows = (await $.env.get('OS')) === 'Windows_NT'
     useDrives(windows)
     inTmux = !windows && Boolean(await $.env.get('TMUX'))
-    inHerdr = !windows && Boolean(await $.env.get('HERDR_ENV'))
+    // ローカル改修：Windows でも herdr の中なら e（Edit with）を herdr のペインで使えるようにする（editorHost と同じ判定）。
+    inHerdr = Boolean(await $.env.get('HERDR_ENV'))
     pictureSession = (await $.session.id()).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || 'session'
     pictureBase = ((await $.env.get('XDG_RUNTIME_DIR')) || (await $.env.get('TMPDIR')) || '/tmp').replace(/\/+$/, '') || '/'
     home = posix(((await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || '').replace(/[\\/]+$/, ''))
